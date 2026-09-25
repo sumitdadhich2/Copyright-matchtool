@@ -1571,16 +1571,6 @@ class Scheduler {
         return
       }
 
-      const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
-      if (cool > Date.now()) {
-        st.state = 'cooling'
-        st.cooldownUntil = cool
-        this.mark(job)
-        await sleep(Math.min(2000, cool - Date.now()))
-        continue
-      }
-      st.cooldownUntil = null
-
       // PER-KEY & PER-MODEL VERIFIER CAP:
       // 2 models × 3 requests = 6 parallel requests per key (30 requests across 5 keys).
       const modelActive = lane.verifyActiveByModel?.get(m.id) || 0
@@ -1751,157 +1741,93 @@ class Scheduler {
     const pk = this.paceSlotKey(lane, m, slot)
     const st = this.modelState(job, lane, m)
 
-    let releaseGlobalLock: ((sec?: number) => void) | null = null
-    try {
-      releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
-        scanId: job.scan.id,
-        scanTitle: job.scan.shortName || job.scan.id,
-        apiKey: lane.apiKey,
-        keyIdx: lane.idx,
-        modelId: m.id,
-        slot,
-        operation: `Verify/Rescan on ${m.id}`,
-        videoSeconds,
-        rpd: m.rpd || 500,
-        onWait: (msg) => {
-          st.state = 'waiting'
-          addLog(job.scan, 'info', msg)
-          this.mark(job)
-        },
-        isStopping: () => job.stopping,
-      })
-
-      const wait = (job.nextFreeAt[pk] || 0) - Date.now()
-      if (wait > 0) {
-        st.state = 'waiting'
-        this.mark(job)
-        await this.stoppableSleep(job, wait)
-      }
-      // STOP CHECK: quota consume karne se PEHLE nikal jao — 'rate' kind se group
-      // bina attempt-penalty ke re-queue hota hai aur worker loop stopping par exit karta hai.
-      if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
-      st.state = 'active'
-      job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
+    for (let rateRetries = 0; ; rateRetries++) {
+      let releaseGlobalLock: ((sec?: number) => void) | null = null
       try {
-        const rawRes = await fn()
-        st.usedToday = incrementModelUsage(m.id, lane.apiKey)
-        globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, slot)
-        this.mark(job)
-        return rawRes
-      } catch (err) {
-        const e = err instanceof GeminiError ? err : classifyError(err)
-        if (e.kind === 'rate' || e.kind === 'rpd') {
-          const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
-            lane.apiKey,
-            m.id,
-            slot,
-            m.rpd || 20,
-            e.kind === 'rpd',
-          )
-          if (outcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
-            st.state = 'exhausted'
-          } else {
-            job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
-            st.state = 'cooling'
-          }
+        releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
+          scanId: job.scan.id,
+          scanTitle: job.scan.shortName || job.scan.id,
+          apiKey: lane.apiKey,
+          keyIdx: lane.idx,
+          modelId: m.id,
+          slot,
+          operation: `Verify/Rescan on ${m.id}`,
+          videoSeconds,
+          rpd: m.rpd || 500,
+          onWait: (msg) => {
+            st.state = 'waiting'
+            addLog(job.scan, 'info', msg)
+            this.mark(job)
+          },
+          isStopping: () => job.stopping,
+        })
+
+        const wait = Math.max(job.nextFreeAt[pk] || 0, job.cooldownUntil[pk] || 0) - Date.now()
+        if (wait > 0) {
+          st.state = 'waiting'
+          this.mark(job)
+          await this.stoppableSleep(job, wait)
         }
-        throw err
+        if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
+        st.state = 'active'
+        job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
+        try {
+          const rawRes = await fn()
+          st.usedToday = incrementModelUsage(m.id, lane.apiKey)
+          globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, slot)
+          this.mark(job)
+          return rawRes
+        } catch (err) {
+          const e = err instanceof GeminiError ? err : classifyError(err)
+          if (e.kind === 'rate' && rateRetries < 2 && !job.stopping) {
+            globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
+            job.cooldownUntil[pk] = Date.now() + RATE_COOLDOWN_MS
+            st.state = 'cooling'
+            addLog(job.scan, 'warn', `Verifier: ${displayModelName(m.id)} (key ${lane.idx}) cooling with prepared clip; waiting for reserved lane before retry`)
+            continue
+          }
+          if (e.kind === 'rate' || e.kind === 'rpd') {
+            const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+              lane.apiKey,
+              m.id,
+              slot,
+              m.rpd || 20,
+              e.kind === 'rpd',
+            )
+            if (outcome.action === 'exhausted') {
+              setModelExhausted(m.id, lane.apiKey)
+              st.state = 'exhausted'
+            } else {
+              job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
+              st.state = 'cooling'
+            }
+          }
+          throw err
+        }
+      } finally {
+        if (releaseGlobalLock) releaseGlobalLock(videoSeconds)
       }
-    } finally {
-      if (releaseGlobalLock) releaseGlobalLock(videoSeconds)
     }
   }
 
-  /** BUSY-RETRY & 1-MINUTE RATE-LIMIT COOLDOWN (verify/rescan):
-   *  Primary request is sent with the already-uploaded clips.
-   *  On 429 rate limit: holds the prepared clips ready in memory, enforces a 1-minute (60s)
-   *  cooldown on that (key × model) lane (notifying globalGeminiCoordinator and the UI),
-   *  and as soon as the 1 minute expires, immediately sends the prepared request without re-extracting or re-uploading.
-   *  On 503/server overload: retries after 2s backoff. */
+  /** Retry temporary server overload with the same uploaded clip while holding the lane. */
   private async sendWithClipBackup(
     job: Job,
-    lane: KeyLane,
-    filePath: string,
     mainUri: string,
-    uploadedNames: string[],
     send: (uri: string) => Promise<string>,
     busyLabel: string,
-    m?: ModelSpec,
-    slot: number = 0,
   ): Promise<string> {
-    let rateRetries = 0
-    const maxRateRetries = 2
-
-    while (true) {
-      if (job.stopping) throw new GeminiError('rate', 'Stop requested')
-      try {
-        return await send(mainUri)
-      } catch (err) {
-        const e = err instanceof GeminiError ? err : classifyError(err)
-
-        if (e.kind === 'rate' && m) {
-          rateRetries++
-          const rk = this.rateKey(lane, m)
-          const pk = this.paceSlotKey(lane, m, slot)
-          const st = this.modelState(job, lane, m)
-
-          if (rateRetries > maxRateRetries) {
-            job.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
-            job.cooldownUntil[pk] = Date.now() + RATE_COOLDOWN_MS
-            globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
-            st.state = 'cooling'
-            st.cooldownUntil = Date.now() + RATE_COOLDOWN_MS
-            this.mark(job)
-            throw err
-          }
-
-          // 1 MINUTE COOLDOWN:
-          const cooldownMs = RATE_COOLDOWN_MS // 60,000 ms (1 minute)
-          const coolUntil = Date.now() + cooldownMs
-
-          job.cooldownUntil[rk] = coolUntil
-          job.cooldownUntil[pk] = coolUntil
-          globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, cooldownMs, slot)
-
-          st.state = 'cooling'
-          st.cooldownUntil = coolUntil
-          this.mark(job)
-
-          addLog(
-            job.scan,
-            'warn',
-            `Verifier: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — giving 1 min cooldown. Prepared clip is held ready; will send immediately when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
-          )
-
-          const waitMs = coolUntil - Date.now()
-          if (waitMs > 0) {
-            await this.stoppableSleep(job, waitMs)
-          }
-
-          if (job.stopping) throw new GeminiError('rate', 'Stop requested during verifier cooldown')
-
-          st.cooldownUntil = null
-          st.state = 'active'
-          this.mark(job)
-
-          addLog(
-            job.scan,
-            'info',
-            `Verifier: 1 min cooldown ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending prepared request now!`,
-          )
-          continue
-        }
-
-        // On temporary server errors (503/overload), wait 2s and retry with the active clip URI
-        const transient = /overload|busy|503|500|internal|try again|temporarily/i.test(e.message)
-        if (!transient) throw err
-
-        addLog(job.scan, 'warn', `${busyLabel}: API server busy (503/overload) — retrying in 2s...`)
-        this.mark(job)
-        await sleep(2000)
-        return await send(mainUri)
-      }
+    if (job.stopping) throw new GeminiError('rate', 'Stop requested')
+    try {
+      return await send(mainUri)
+    } catch (err) {
+      const e = err instanceof GeminiError ? err : classifyError(err)
+      const transient = /overload|busy|503|500|internal|try again|temporarily/i.test(e.message)
+      if (e.kind === 'rate' || e.kind === 'rpd' || !transient) throw err
+      addLog(job.scan, 'warn', `${busyLabel}: API server busy (503/overload) — retrying in 2s...`)
+      this.mark(job)
+      await this.stoppableSleep(job, 2000)
+      return await send(mainUri)
     }
   }
 
@@ -1984,14 +1910,9 @@ class Scheduler {
           () =>
             this.sendWithClipBackup(
               job,
-              lane,
-              movieClipFile,
               movieClip.uri,
-              uploadedNames,
               (uri) => verifyRequest(lane.ai, vm.id, shortClip.uri, uri, verifyPadNote),
               `Verify short ${ts(g.shortStart)}–${ts(g.shortEnd)} on ${vm.id} (key ${lane.idx})`,
-              vm,
-              slot,
             ),
           slot,
         )
@@ -2084,14 +2005,9 @@ class Scheduler {
             () =>
               this.sendWithClipBackup(
                 job,
-                lane,
-                chunkFile,
                 chunkUp.uri,
-                uploadedNames,
                 (uri) => rescanRequest(lane.ai, rm.id, shortClip.uri, uri, rescanPadNote, rescanHintNote),
                 `Rescan chunk ${c.chunkIndex} on ${rm.id} (key ${lane.idx})`,
-                rm,
-                slot,
               ),
             slot,
           )
@@ -2127,14 +2043,9 @@ class Scheduler {
           () =>
             this.sendWithClipBackup(
               job,
-              lane,
-              reFile,
               reUp.uri,
-              uploadedNames,
               (uri) => verifyRequest(lane.ai, rvm.id, shortClip.uri, uri, verifyPadNote),
               `Re-verify rescan window on ${rvm.id} (key ${lane.idx})`,
-              rvm,
-              slot,
             ),
           slot,
         )
@@ -2357,7 +2268,8 @@ class Scheduler {
 
       // Cooldown check (RPM/TPM-type 429).
       const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
-      if (cool > Date.now()) {
+      const prepared = job.queue.some((ci) => lane.chunkUploads.has(ci))
+      if (cool > Date.now() && !prepared) {
         st.state = 'cooling'
         st.cooldownUntil = cool
         st.currentChunk = null
@@ -2373,7 +2285,7 @@ class Scheduler {
       // This allows any other worker on an idle/free key (e.g. Key 3 · gemini-3.8, Key 2 · gemini-3.6)
       // to pull from job.queue immediately without any wait!
       const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0)
-      if (laneBusy.busy) {
+      if (laneBusy.busy && !(prepared && laneBusy.cooling)) {
         st.state = laneBusy.cooling ? 'cooling' : 'waiting'
         st.currentChunk = null
         await sleep(1000)
@@ -2468,6 +2380,8 @@ class Scheduler {
           return
         }
 
+        const localCooldown = (job.cooldownUntil[rk] || 0) - Date.now()
+        if (localCooldown > 0) await this.stoppableSleep(job, localCooldown)
         const [shortUri, uploaded] = await uploadsP
         chunkFileName = uploaded.name
 

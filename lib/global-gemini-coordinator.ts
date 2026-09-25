@@ -22,6 +22,9 @@ interface LaneWaiter {
   scanId: string
   scanTitle: string
   operation: string
+  apiKey: string
+  rpd: number
+  videoSeconds: number
   resolve: (releaseFn: (actualVideoSec?: number, cooldownOverrideMs?: number) => void) => void
   reject: (err: Error) => void
   isStopping?: () => boolean
@@ -47,9 +50,42 @@ interface GlobalLaneState {
   waiters: LaneWaiter[]
 }
 
+interface ModelRecovery {
+  cooldownUntil: number
+  owner: string | null
+  nextSendAt: number
+}
+
+const RECOVERY_STAGGER_MS = 3_000
+
 class GlobalGeminiCoordinator {
   private lanes = new Map<string, GlobalLaneState>()
+  private recoveries = new Map<string, ModelRecovery>()
   private currentActiveDay = geminiUsageDay()
+
+  private recoveryWait(lane: GlobalLaneState, now: number): number {
+    const recovery = this.recoveries.get(`${lane.keyHash}:${lane.modelId}`)
+    if (!recovery) return 0
+    if (recovery.owner) return RECOVERY_STAGGER_MS
+    return Math.max(0, recovery.cooldownUntil - now, recovery.nextSendAt - now)
+  }
+
+  private occupy(lane: GlobalLaneState, scanId: string, scanTitle: string, operation: string): void {
+    lane.activeScanId = scanId
+    lane.activeScanTitle = scanTitle
+    lane.activeOperation = operation
+    lane.activeSince = Date.now()
+    const recovery = this.recoveries.get(`${lane.keyHash}:${lane.modelId}`)
+    if (recovery) recovery.owner = lane.laneKey
+  }
+
+  private wakeModel(lane: GlobalLaneState): void {
+    for (const other of this.lanes.values()) {
+      if (other.keyHash === lane.keyHash && other.modelId === lane.modelId && other.waiters.length > 0) {
+        void this.processNext(other)
+      }
+    }
+  }
 
   /**
    * Checks if the date has rolled over (midnight Pacific Time).
@@ -64,6 +100,7 @@ class GlobalGeminiCoordinator {
         lane.isExhausted = false
         lane.cooldownUntil = 0
       }
+      this.recoveries.clear()
       checkDailyReset()
       return true
     }
@@ -151,6 +188,10 @@ class GlobalGeminiCoordinator {
       }
     }
 
+    if (lane.waiters.length > 0 || this.recoveryWait(lane, now) > 0) {
+      return { busy: true, cooling: true, waitSec: Math.ceil(this.recoveryWait(lane, now) / 1000) }
+    }
+
     if (lane.cooldownUntil > now) {
       return {
         busy: true,
@@ -193,6 +234,7 @@ class GlobalGeminiCoordinator {
       lane.cooldownUntil = 0
       lane.nextFreeAt = 0
     }
+    this.recoveries.clear()
     console.log('[Global Coordinator] All lane exhaustion and cooldown states reset.')
   }
 
@@ -213,7 +255,7 @@ class GlobalGeminiCoordinator {
     rpd?: number
     onWait?: (msg: string, waitSec: number) => void
     isStopping?: () => boolean
-  }): Promise<(actualVideoSec?: number) => void> {
+  }): Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void> {
     const {
       scanId,
       scanTitle = scanId,
@@ -254,9 +296,9 @@ class GlobalGeminiCoordinator {
 
         // If lane is currently active in another scan OR there are earlier waiters queued
         const hasOtherActive = lane.activeScanId !== null
-        const isQueuedBehindOthers = lane.waiters.length > 0 && lane.waiters[0]?.scanId !== scanId
+        const isQueuedBehindOthers = lane.waiters.length > 0
 
-        if (hasOtherActive || isQueuedBehindOthers) {
+        if (hasOtherActive || isQueuedBehindOthers || this.recoveryWait(lane, now) > 0) {
           const waitMsg = hasOtherActive
             ? `[Global Coordinator] Key ${lane.keyIdx} · ${modelId} is busy in Scan "${lane.activeScanTitle || lane.activeScanId}" (${lane.activeOperation || 'working'}). Waiting for lane to become free...`
             : `[Global Coordinator] Key ${lane.keyIdx} · ${modelId} is queued behind other scans. Waiting turn...`
@@ -267,10 +309,14 @@ class GlobalGeminiCoordinator {
             scanId,
             scanTitle,
             operation,
+            apiKey,
+            rpd,
+            videoSeconds,
             resolve: (releaseFn) => resolve(releaseFn),
             reject,
             isStopping,
           })
+          if (!hasOtherActive) void this.processNext(lane)
           return
         }
 
@@ -295,6 +341,9 @@ class GlobalGeminiCoordinator {
             scanId,
             scanTitle,
             operation,
+            apiKey,
+            rpd,
+            videoSeconds,
             resolve: (releaseFn) => resolve(releaseFn),
             reject,
             isStopping,
@@ -323,6 +372,9 @@ class GlobalGeminiCoordinator {
             scanId,
             scanTitle,
             operation,
+            apiKey,
+            rpd,
+            videoSeconds,
             resolve: (releaseFn) => resolve(releaseFn),
             reject,
             isStopping,
@@ -331,12 +383,12 @@ class GlobalGeminiCoordinator {
         }
 
         // Lock is free! Acquire exclusively now.
-        lane.activeScanId = scanId
-        lane.activeScanTitle = scanTitle
-        lane.activeOperation = operation
-        lane.activeSince = Date.now()
+        this.occupy(lane, scanId, scanTitle, operation)
 
+        let released = false
         const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          if (released) return
+          released = true
           this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
         }
 
@@ -417,16 +469,16 @@ class GlobalGeminiCoordinator {
           lane.activeScanId === null &&
           lane.cooldownUntil <= now &&
           lane.nextFreeAt <= now &&
-          lane.waiters.length === 0
+          lane.waiters.length === 0 &&
+          this.recoveryWait(lane, now) === 0
 
         if (isFree) {
-          // Immediately grab this free lane!
-          lane.activeScanId = scanId
-          lane.activeScanTitle = scanTitle
-          lane.activeOperation = operation
-          lane.activeSince = Date.now()
+          this.occupy(lane, scanId, scanTitle, operation)
 
+          let released = false
           const release = (actualVideoSec?: number) => {
+            if (released) return
+            released = true
             this.releaseLane(lane, actualVideoSec ?? videoSeconds)
           }
 
@@ -440,7 +492,7 @@ class GlobalGeminiCoordinator {
         const cdWait = Math.max(0, lane.cooldownUntil - now)
         const paceWait = Math.max(0, lane.nextFreeAt - now)
         const activeWait = lane.activeScanId ? 4000 : 0
-        const totalWait = Math.max(cdWait, paceWait, activeWait)
+        const totalWait = Math.max(cdWait, paceWait, activeWait, this.recoveryWait(lane, now))
         return { c, lane, totalWait }
       })
 
@@ -479,6 +531,12 @@ class GlobalGeminiCoordinator {
     lane.activeScanTitle = null
     lane.activeOperation = null
     lane.activeSince = null
+    const recovery = this.recoveries.get(`${lane.keyHash}:${lane.modelId}`)
+    if (recovery?.owner === lane.laneKey) {
+      recovery.owner = null
+      recovery.nextSendAt = Math.max(recovery.nextSendAt, now + RECOVERY_STAGGER_MS)
+      setTimeout(() => this.wakeModel(lane), Math.max(0, recovery.nextSendAt - now) + 1)
+    }
 
     // Process next waiter in queue after pacing expires (or schedule it)
     if (lane.waiters.length > 0) {
@@ -488,7 +546,7 @@ class GlobalGeminiCoordinator {
     }
   }
 
-  private async processNext(lane: GlobalLaneState) {
+  private processNext(lane: GlobalLaneState) {
     if (lane.activeScanId !== null) return // still busy
 
     while (lane.waiters.length > 0) {
@@ -500,13 +558,19 @@ class GlobalGeminiCoordinator {
         continue
       }
 
+      if (this.isModelExhausted(next.apiKey, lane.modelId, next.rpd)) {
+        next.reject(new Error(`[Global Coordinator] Key ${lane.keyIdx} (${lane.modelId}) daily quota exhausted`))
+        continue
+      }
+
       const now = Date.now()
-      if (lane.cooldownUntil > now) {
+      const recoveryWait = this.recoveryWait(lane, now)
+      if (lane.cooldownUntil > now || recoveryWait > 0) {
         // Still in cooldown, put back and wait
         lane.waiters.unshift(next)
-        const waitMs = lane.cooldownUntil - now
+        const waitMs = Math.max(lane.cooldownUntil - now, recoveryWait)
         setTimeout(() => {
-          void this.processNext(lane)
+          this.processNext(lane)
         }, waitMs + 50)
         return
       }
@@ -522,13 +586,13 @@ class GlobalGeminiCoordinator {
       }
 
       // Lane is free to take
-      lane.activeScanId = next.scanId
-      lane.activeScanTitle = next.scanTitle
-      lane.activeOperation = next.operation
-      lane.activeSince = Date.now()
+      this.occupy(lane, next.scanId, next.scanTitle, next.operation)
 
-      const releaseFn = (actualVideoSec?: number) => {
-        this.releaseLane(lane, actualVideoSec ?? 60)
+      let released = false
+      const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+        if (released) return
+        released = true
+        this.releaseLane(lane, actualVideoSec ?? next.videoSeconds, cooldownOverrideMs)
       }
 
       next.resolve(releaseFn)
@@ -548,6 +612,11 @@ class GlobalGeminiCoordinator {
     const now = Date.now()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
+    const modelKey = `${kh}:${modelId}`
+    const recovery = this.recoveries.get(modelKey) || { cooldownUntil: 0, owner: null, nextSendAt: 0 }
+    recovery.cooldownUntil = Math.max(recovery.cooldownUntil, now + cooldownMs)
+    recovery.nextSendAt = Math.max(recovery.nextSendAt, recovery.cooldownUntil + RECOVERY_STAGGER_MS)
+    this.recoveries.set(modelKey, recovery)
 
     // Cooldown only slots for THIS specific model on this API key.
     // Each model has its own independent 250k TPM and 15 RPM quota!
